@@ -56,6 +56,57 @@ class TrainingWorker(QThread):
             print(f"[TRAIN] Device:     {self.device or 'auto'}")
             print(f"[TRAIN] ============================================\n")
 
+            self.progress.emit("Validating master dataset before training...")
+            import yaml
+            with open(self.data_yaml, 'r') as f:
+                data = yaml.safe_load(f)
+                num_classes = len(data.get('names', []))
+                
+            base_dir = os.path.dirname(self.data_yaml)
+            invalid_labels = 0
+            total_images = 0
+            class_counts = {i: 0 for i in range(num_classes)}
+            
+            for split in ['train', 'val']:
+                img_dir = os.path.join(base_dir, 'images', split)
+                lbl_dir = os.path.join(base_dir, 'labels', split)
+                if os.path.isdir(img_dir):
+                    for img_f in os.listdir(img_dir):
+                        if img_f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                            total_images += 1
+                            lbl_f = os.path.splitext(img_f)[0] + '.txt'
+                            lbl_p = os.path.join(lbl_dir, lbl_f)
+                            if not os.path.exists(lbl_p):
+                                invalid_labels += 1
+                            else:
+                                with open(lbl_p, 'r') as f:
+                                    for line in f.readlines():
+                                        parts = line.strip().split()
+                                        if len(parts) == 5:
+                                            cid = int(float(parts[0]))
+                                            if cid < 0 or cid >= num_classes:
+                                                invalid_labels += 1
+                                            elif cid in class_counts:
+                                                class_counts[cid] += 1
+                                                
+            if invalid_labels > 0:
+                raise Exception(f"Dataset validation failed: Found {invalid_labels} invalid labels out of bounds out of {total_images} images.")
+            
+            print("\n" + "="*50)
+            print("MASTER DATASET VALIDATION & TRAINING LOG")
+            print("="*50)
+            print(f"Master Dataset Path: {base_dir}")
+            print(f"Total Classes: {num_classes}")
+            print(f"Total Images: {total_images}")
+            print("Class Mapping & Distribution:")
+            if isinstance(data.get('names'), dict):
+                names_dict = data['names']
+            else:
+                names_dict = {i: n for i, n in enumerate(data.get('names', []))}
+            for cid, cname in names_dict.items():
+                print(f"  ID {cid}: '{cname}' -> {class_counts.get(cid, 0)} instances")
+            print("="*50 + "\n")
+
             self.progress.emit(f"Loading base model: {base_path}")
             model = YOLO(base_path)
             
@@ -581,17 +632,40 @@ class TrainingDialog(QDialog):
         if not hasattr(self, '_valid_pairs') or not self._valid_pairs:
             return
             
-        proj = self.proj_name.text().strip()
-        if not proj: proj = "custom_project"
+        # 1. ALWAYS USE MASTER DATASET
+        base_dir = os.path.join(_PROJECT_ROOT, "datasets", "daily_objects")
+        yaml_path = os.path.join(base_dir, "data.yaml")
         
-        base_dir = os.path.join(_PROJECT_ROOT, "datasets", proj)
+        master_classes = {} # mapping master_id -> class_name
         
-        # Clean stale data from previous runs to prevent data leakage
+        if os.path.exists(yaml_path):
+            try:
+                import yaml
+                with open(yaml_path, 'r') as f:
+                    data = yaml.safe_load(f)
+                    if 'names' in data:
+                        if isinstance(data['names'], dict):
+                            master_classes = {int(k): v for k, v in data['names'].items()}
+                        elif isinstance(data['names'], list):
+                            master_classes = {i: v for i, v in enumerate(data['names'])}
+            except Exception as e:
+                print("Could not parse existing data.yaml, starting fresh.", e)
+        
+        # Build list of classes
+        master_class_list = [master_classes.get(i, f"class_{i}") for i in range(len(master_classes) if master_classes else 0)]
+        
+        local_classes = [self.class_list.item(i).text() for i in range(self.class_list.count())]
+        
+        class_mapping = {}
+        for local_idx, cname in enumerate(local_classes):
+            if cname not in master_class_list:
+                master_class_list.append(cname)
+            class_mapping[local_idx] = master_class_list.index(cname)
+            
+        # Create directories without removing old ones!
         for split in ["train", "val"]:
             for kind in ["images", "labels"]:
                 d = os.path.join(base_dir, kind, split)
-                if os.path.isdir(d):
-                    shutil.rmtree(d)
                 os.makedirs(d, exist_ok=True)
 
         pairs = self._valid_pairs
@@ -611,18 +685,32 @@ class TrainingDialog(QDialog):
         
         total_train = 0
         total_val = 0
-        
+
+        # Helper to read, map, and write labels
+        def map_and_copy_label(src_txt, dst_txt):
+            try:
+                with open(src_txt, 'r') as f:
+                    lines = f.readlines()
+                with open(dst_txt, 'w') as f:
+                    for line in lines:
+                        parts = line.strip().split()
+                        if len(parts) == 5:
+                            old_id = int(float(parts[0]))
+                            new_id = class_mapping.get(old_id, old_id) # map to new ID
+                            f.write(f"{new_id} {' '.join(parts[1:])}\n")
+            except Exception as e:
+                print(f"Failed to map label {src_txt}: {e}")
+
         # Process Validation (NO AUGMENTATION EVER)
         for img_path, txt_path in val_pairs:
             shutil.copy2(img_path, os.path.join(base_dir, "images", "val", os.path.basename(img_path)))
-            shutil.copy2(txt_path, os.path.join(base_dir, "labels", "val", os.path.basename(txt_path)))
+            map_and_copy_label(txt_path, os.path.join(base_dir, "labels", "val", os.path.basename(txt_path)))
             total_val += 1
             
         # Process Training (WITH optional AUGMENTATION)
         for img_path, txt_path in train_pairs:
-            # Copy original
             shutil.copy2(img_path, os.path.join(base_dir, "images", "train", os.path.basename(img_path)))
-            shutil.copy2(txt_path, os.path.join(base_dir, "labels", "train", os.path.basename(txt_path)))
+            map_and_copy_label(txt_path, os.path.join(base_dir, "labels", "train", os.path.basename(txt_path)))
             total_train += 1
             
             if do_augment:
@@ -637,26 +725,32 @@ class TrainingDialog(QDialog):
                                 out_img = os.path.join(base_dir, "images", "train", f"{base_name}_aug_{i}.jpg")
                                 out_txt = os.path.join(base_dir, "labels", "train", f"{base_name}_aug_{i}.txt")
                                 cv2.imwrite(out_img, aug_img)
-                                write_yolo_labels(out_txt, aug_bboxes)
+                                
+                                # Remap aug_bboxes before writing!
+                                mapped_aug_bboxes = []
+                                for b in aug_bboxes:
+                                    old_id = int(b[0])
+                                    new_id = class_mapping.get(old_id, old_id)
+                                    mapped_aug_bboxes.append((new_id, b[1], b[2], b[3], b[4]))
+                                    
+                                write_yolo_labels(out_txt, mapped_aug_bboxes)
                                 total_train += 1
                 except Exception as e:
                     print(f"Augmentation failed for {img_path}: {e}")
                 
         # data.yaml
-        classes = [self.class_list.item(i).text() for i in range(self.class_list.count())]
-        yaml_path = os.path.join(base_dir, "data.yaml")
         with open(yaml_path, 'w') as f:
             abs_base = os.path.abspath(base_dir).replace('\\', '/')
             f.write(f"path: {abs_base}\n")
             f.write(f"train: images/train\n")
             f.write(f"val: images/val\n\n")
             f.write("names:\n")
-            for i, c in enumerate(classes):
+            for i, c in enumerate(master_class_list):
                 f.write(f"  {i}: {c}\n")
                 
         self.data_yaml_path = yaml_path
-        self.lbl_prep_status.setText(f"Dataset ready.\nOriginals: {len(pairs)}\nTrain Samples: {total_train}\nVal Samples: {total_val}")
-        QMessageBox.information(self, "Success", f"Dataset created and split successfully!\nTrain: {total_train} samples\nVal: {total_val} samples\ndata.yaml generated.")
+        self.lbl_prep_status.setText(f"Master Dataset ready.\nOriginals Added: {len(pairs)}\nTrain Samples Added: {total_train}\nVal Samples Added: {total_val}")
+        QMessageBox.information(self, "Success", f"Master Dataset updated successfully!\nAdded Train: {total_train} samples\nAdded Val: {total_val} samples\ndata.yaml updated with {len(master_class_list)} classes.")
         
     def _start_training(self):
         if not hasattr(self, 'data_yaml_path') or not os.path.exists(self.data_yaml_path):
